@@ -1,0 +1,196 @@
+<#
+.SYNOPSIS
+    Read-only hunt for the November 11, 2026 ScreenConnect "RelayTrap" rogue-client campaign.
+.CREDIT
+    Originally posted here: www.reddit.com/r/msp/comments/1xts3f2/active_malware_campaign_abusing_screenconnect/?solution=fb63b1b849398d6afb63b1b849398d6a&js_challenge=1&jsc_token=2824be10929bdc604753c70a67a1c3310d238ce00495c21bdf4593c5d2d86b49&jsc_orig_r=
+    Originally posted by reddit u/Skrunky
+    Modified by IST Services
+
+.DESCRIPTION
+    Context: An active campaign (first seen ~17:47 UTC, 2026-11-11) uses compromised
+    ScreenConnect cloud panel access to push a secondary rogue SC client to endpoints via
+    Run Command, then persists with a SYSTEM scheduled task, a Run key, and a RelayTrap
+    payload directory. Reported as credential/session abuse, not a new zero-day.
+
+    IOC sources:  thread "Active malware campaign abusing ScreenConnect" (2026-11-11),
+    including additional indicators credited to Blackpoint. IOCs current as of
+    2026-11-11 ~21:00 UTC. Check the thread for updates.
+
+    This script makes NO changes. It checks:
+      - ScreenConnect client services: known rogue IDs, c=Exploited property, IOC relays,
+        and any instance not on your known-good list
+      - TrapWatch scheduled task
+      - RelayTrapLiteAlert / RelayTrap Run-key persistence (HKLM + all loaded user hives)
+      - C:\ProgramData\RelayTrap and %TEMP%\sckit-* (all profiles)
+      - Named payload files, plus sqlite3.exe in temp/ProgramData (used to scrape browser tokens)
+      - Live TCP connections to IOC IPs
+      - DNS cache entries for IOC domains
+
+    Run it from your RMM or EDR as SYSTEM. Do NOT triage suspected machines with an
+    interactive ScreenConnect session; per the original report, the payload can ride
+    an active session back to the technician's workstation.
+
+    Exit codes: 0 = clean, 1 = findings (IOC hit or review item).
+
+.PARAMETER KnownThumbprints
+    Your own SC instance thumbprint(s): the value in parentheses in the service name
+    "ScreenConnect Client (xxxxxxxxxxxxxxxx)".
+
+.PARAMETER KnownRelayHosts
+    Your own SC relay host(s), e.g. instance-abc123-relay.screenconnect.com.
+    Leftover one-time support clients from your instance are matched by relay.
+
+.PARAMETER NinjaOne
+    Also write results to NinjaOne custom fields (create them first, Automation access = Read/Write):
+      -StatusField  (Text)        default: c   e.g. "IOC HIT (2) - 2026-11-11 15:00"
+      -DetailsField (Multi-line)  default: scHuntDetails
+
+.EXAMPLE
+    .\Invoke-SCRelayTrapHunt.ps1 -KnownThumbprints 'abcdef0123456789' -KnownRelayHosts 'instance-abc123-relay.screenconnect.com'
+
+.EXAMPLE
+    .\Invoke-SCRelayTrapHunt.ps1 -KnownThumbprints 'abcdef0123456789' -NinjaOne
+
+.NOTES
+    Provided as-is, no warranty. Review before running. IOCs will change. Update the lists below.
+    Status meanings: IOC HIT = hard indicator match. REVIEW = unknown SC instance or stray
+    sqlite3.exe only (often a vendor or prior-MSP client; verify, don't assume).
+    
+    2026-11-11, IST Services
+    Modified $NinjaOne in param block to use bool type instead of switch since Ninja does not passes either "True" or "False" on a checkbox, which throws an error with type = switch
+    Modified KnownThumbprints and KnownRelayHosts with '' to fix errors with how Ninja builds/passes strings since the old param expected strings as an array.
+    Added Fallback methods:  ensures that whether NinjaOne passes the value via command-line parameters or environment variables, it will be caught correctly.
+    Depending on the execution context (such as scheduled tasks vs. manual technician runs), 
+    NinjaOne sometimes passes parameters via environment variables ($env:KnownThumbprints) rather than standard command-line parameter binding.
+    Additionally, PowerShell's boolean evaluation (-not) on arrays can sometimes behave unexpectedly if an array is evaluated loosely.
+#>
+param(
+    [string[]]$KnownThumbprints = '',
+    [string[]]$KnownRelayHosts  = '',
+    [bool]$NinjaOne             = $true,
+    [string]$StatusField  = 'scHuntStatus',
+    [string]$DetailsField = 'scHuntDetails'
+)
+
+$ErrorActionPreference = 'SilentlyContinue'
+
+# Fallback to NinjaOne environment variables if parameters weren't bound via param()
+if (-not $KnownThumbprints -and $env:KnownThumbprints) { $KnownThumbprints = $env:KnownThumbprints }
+if (-not $KnownRelayHosts  -and $env:KnownRelayHosts)  { $KnownRelayHosts  = $env:KnownRelayHosts }
+if (-not $NinjaOne         -and $env:NinjaOne)         { $NinjaOne         = [bool]$env:NinjaOne }
+if (-not $StatusField      -and $env:StatusField)      { $StatusField      = $env:StatusField }
+if (-not $DetailsField     -and $env:DetailsField)     { $DetailsField     = $env:DetailsField }
+
+$findings = New-Object System.Collections.Generic.List[string]
+$info     = New-Object System.Collections.Generic.List[string]
+
+# ================= IOCs (update as the thread is updated) =================
+$RogueThumbprints = @('2588ef5c15954b10', 'ed630cc2c873b091')
+$IocIPs           = @('185.99.255.28', '155.94.150.39')
+$IocDomains       = @('newnewnew.gotdns.org', 'soxnewwork.homedns.org', 'payproofkit.com',
+                      'mo7sen.dev', 'cdn007-digitaldownloads.com')
+$IocFileNames     = @('Panel-Lateral.ps1', 'runnew.cmd', 'ToolboxRelayUploader.exe', 'Run-Lateral-Full.bat')
+$IocRunValues     = @('RelayTrapLiteAlert')
+$IocTaskNames     = @('TrapWatch')
+# ===========================================================================
+
+$KnownThumbprints = $KnownThumbprints | ForEach-Object { $_.ToLower() }
+if (-not $KnownThumbprints -and -not $KnownRelayHosts) {
+    $info.Add('NOTE: No known-good thumbprints/relays supplied; every SC client will be flagged for REVIEW.')
+}
+
+# --- 1. ScreenConnect client services ---
+$scServices = Get-CimInstance Win32_Service | Where-Object {
+    $_.Name -like 'ScreenConnect Client*' -or $_.PathName -match 'ScreenConnect\.ClientService\.exe'
+}
+foreach ($svc in $scServices) {
+    $path  = [string]$svc.PathName
+    $thumb = if ($svc.Name -match '\(([^)]+)\)') { $Matches[1].ToLower() } else { 'unknown' }
+    $relay = if ($path -match '[?&]h=([^&"]+)') { $Matches[1] } else { 'unknown' }
+    $line  = "SC service '$($svc.Name)' state=$($svc.State) relay=$relay"
+
+    if     ($RogueThumbprints -contains $thumb)                           { $findings.Add("ROGUE CLIENT ID: $line") }
+    elseif ($path -match '[?&]c=Exploited')                               { $findings.Add("c=Exploited PROPERTY: $line") }
+    elseif ($IocIPs | Where-Object { $path -match [regex]::Escape($_) })  { $findings.Add("IOC RELAY IP: $line") }
+    elseif ($IocDomains | Where-Object { $relay -like "*$_" })            { $findings.Add("IOC RELAY DOMAIN: $line") }
+    elseif ($KnownThumbprints -contains $thumb -or $KnownRelayHosts -contains $relay) { $info.Add("Known SC client: $line") }
+    else                                                                  { $findings.Add("UNKNOWN SC INSTANCE: $line") }
+}
+
+# --- 2. Scheduled tasks ---
+Get-ScheduledTask | Where-Object { $n = $_.TaskName; $IocTaskNames | Where-Object { $n -like "*$_*" } } | ForEach-Object {
+    $act = ($_.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments)" }) -join ' | '
+    $findings.Add("SCHEDULED TASK: $($_.TaskPath)$($_.TaskName) -> $act")
+}
+
+# --- 3. Run-key persistence (HKLM + every loaded user hive) ---
+$runKeys = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+             'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce',
+             'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run')
+$runKeys += Get-ChildItem 'Registry::HKEY_USERS' | Where-Object { $_.PSChildName -notlike '*_Classes' } | ForEach-Object {
+    "Registry::HKEY_USERS\$($_.PSChildName)\Software\Microsoft\Windows\CurrentVersion\Run"
+    "Registry::HKEY_USERS\$($_.PSChildName)\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+}
+foreach ($rk in $runKeys) {
+    $props = Get-ItemProperty $rk
+    if (-not $props) { continue }
+    foreach ($p in $props.PSObject.Properties) {
+        if ($p.Name -like 'PS*') { continue }
+        if ($IocRunValues -contains $p.Name -or [string]$p.Value -match 'RelayTrap') {
+            $findings.Add("RUN KEY: $rk\$($p.Name) = $($p.Value)")
+        }
+    }
+}
+
+# --- 4. Persistence folders ---
+if (Test-Path 'C:\ProgramData\RelayTrap') { $findings.Add('FOLDER: C:\ProgramData\RelayTrap exists') }
+
+$tempRoots = @('C:\Windows\Temp') + (Get-ChildItem 'C:\Users' -Directory | ForEach-Object { Join-Path $_.FullName 'AppData\Local\Temp' })
+foreach ($tr in $tempRoots) {
+    Get-ChildItem $tr -Filter 'sckit-*' -Force | ForEach-Object { $findings.Add("TEMP ARTIFACT: $($_.FullName)") }
+}
+
+# --- 5. Payload files / sqlite3 ---
+$searchRoots = @('C:\ProgramData', 'C:\Users\Public', 'C:\Windows\Temp') + $tempRoots
+$searchRoots += Get-ChildItem 'C:\Users' -Directory | ForEach-Object { Join-Path $_.FullName 'Downloads' }
+foreach ($root in ($searchRoots | Select-Object -Unique)) {
+    if (-not (Test-Path $root)) { continue }
+    Get-ChildItem $root -Recurse -Depth 4 -File -Force |
+        Where-Object { $IocFileNames -contains $_.Name -or $_.Name -eq 'sqlite3.exe' } |
+        ForEach-Object {
+            $tag = if ($_.Name -eq 'sqlite3.exe') { 'SUSPICIOUS sqlite3.exe' } else { 'IOC FILE' }
+            $findings.Add("${tag}: $($_.FullName) (modified $($_.LastWriteTime))")
+        }
+}
+
+# --- 6. Live connections to IOC IPs ---
+Get-NetTCPConnection | Where-Object { $IocIPs -contains $_.RemoteAddress } | ForEach-Object {
+    $proc = (Get-Process -Id $_.OwningProcess).Path
+    $findings.Add("C2 CONNECTION: $($_.RemoteAddress):$($_.RemotePort) state=$($_.State) proc=$proc")
+}
+
+# --- 7. DNS cache ---
+Get-DnsClientCache | Where-Object { $n = $_.Entry; $IocDomains | Where-Object { $n -like "*$_" } } |
+    ForEach-Object { $findings.Add("DNS CACHE HIT: $($_.Entry) -> $($_.Data)") }
+
+# --- Output ---
+$stamp    = Get-Date -Format 'yyyy-MM-dd HH:mm'
+$findings = @($findings | Select-Object -Unique)
+$review   = @($findings | Where-Object { $_ -like 'UNKNOWN SC INSTANCE*' -or $_ -like 'SUSPICIOUS sqlite3*' })
+$hard     = @($findings | Where-Object { $review -notcontains $_ })
+
+if     ($hard.Count -gt 0)     { $status = "IOC HIT ($($hard.Count)) - $stamp" }
+elseif ($findings.Count -gt 0) { $status = "REVIEW ($($findings.Count)) - $stamp" }
+else                           { $status = "CLEAN - $stamp" }
+
+$details = (@("Host: $env:COMPUTERNAME  Scan: $stamp  Status: $status") +
+            ($findings | ForEach-Object { "[!] $_" }) +
+            ($info     | ForEach-Object { "[ok] $_" })) -join "`n"
+
+if ($NinjaOne -and (Get-Command Ninja-Property-Set -ErrorAction SilentlyContinue)) {
+    Ninja-Property-Set $StatusField  $status
+    Ninja-Property-Set $DetailsField ($details.Substring(0, [Math]::Min($details.Length, 9900)))
+}
+
+Write-Output $details
+if ($findings.Count -gt 0) { exit 1 } else { exit 0 }
