@@ -18,6 +18,14 @@ This script creates the listapps function, that can be used to list all installe
 
 Currently, it can get the list from the registry, scoop, winget, chocolatey, pip, pipx, npm, yarn and cargo.
 
+The default listing includes an `InstallSource` column and adds package-manager entries not already present in the registry listing. It cross-checks entries with WinGet, Scoop and Chocolatey package lists, matching normalized names. A unique match is labeled with its manager; unmatched or ambiguous entries are labeled `unknown`. This is a best-effort match and does not prove which installer originally installed a program.
+
+This has been tested and validated with winget, but not with the other package managers to the same extent. They may need additional tweaking.
+
+Run `listapps check` to see which package managers are available. The availability report is shown before a listing by default; use `listapps -ShowSources false` to hide it. Manager-specific commands check that the requested manager is available before running.
+
+Use `listapps -Csv` to save the default consolidated listing, including headers, to `listapps.csv` in the current folder. Specify a custom destination with `listapps -Csv <path>` or `listapps -CsvPath <path>`. CSV export automatically selects the consolidated listing and suppresses the package-manager report, even if a manager argument was provided. Existing files are not overwritten unless `-Force` is specified.
+
 ## Simple To Install
 
 It works as a wrapper for other commands, so it is not necessary to install it.
